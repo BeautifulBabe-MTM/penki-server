@@ -1,15 +1,11 @@
-// gameEngine.js
-// Simple game engine for "пенёк" variant you described.
-// JS (no TS) — meant to be run on Node server side (authoritative).
-
 const DEFAULT_CONFIG = {
-    use52: false, // false -> 36 cards (6..A)
-    handSizeOnDeal: 1, // initial open card count (we will give each player 1 open + 2 penki + maybe more later)
-    fullHandSize: 6, // after each round players draw until this number (optional rule) - you can change
+    use52: false,
+    handSizeOnDeal: 1,
+    fullHandSize: 6,
 };
 
 const SUITS = ['♠', '♥', '♦', '♣'];
-const RANKS36 = [6, 7, 8, 9, 10, 11, 12, 13, 14]; // 11=J,12=Q,13=K,14=A
+const RANKS36 = [6, 7, 8, 9, 10, 11, 12, 13, 14];
 const RANKS52 = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
 function makeDeck(use52 = false) {
@@ -37,23 +33,16 @@ function cardToString(c) {
     return `${map[c.rank] || c.rank}${c.suit}`;
 }
 
-/* helper: compare ranks in linear order (6..A), we assume higher numeric = stronger */
 function isHigherRank(aRank, bRank) {
-    // aRank > bRank in normal numerical ordering
     return aRank > bRank;
 }
 
-/* can defence beat attack given trumpSuit and special spade rules */
 function canBeat(attackCard, defenceCard, trumpSuit, use52 = false) {
     if (!attackCard || !defenceCard) return false;
-    // 7♠ special: 7 of spades beats any card when played as defense (we handle close-round elsewhere)
-    // But defending to beat 7♠? 7♠ as attack acts as winning card; rule: 7♠ бьёт любую карту и закрывает круг моментально.
-    // Spade-specific: if attack is spade, only spade can beat it.
     if (attackCard.suit === '♠') {
         if (defenceCard.suit !== '♠') return false;
         return isHigherRank(defenceCard.rank, attackCard.rank);
     }
-    // Normal case: same suit and higher rank OR defence is trump (if attack is not spade and trump exists and defence is trump)
     if (defenceCard.suit === attackCard.suit && isHigherRank(defenceCard.rank, attackCard.rank)) return true;
     if (trumpSuit && defenceCard.suit === trumpSuit && attackCard.suit !== '♠') return true;
     return false;
@@ -76,12 +65,12 @@ class Game {
     constructor(id, config = {}) {
         this.id = id;
         this.config = Object.assign({}, DEFAULT_CONFIG, config);
-        this.players = []; // ordered array
+        this.players = [];
         this.deck = [];
         this.discard = []; // отбои
-        this.stack = []; // linear stack: bottom = index 0, top = last
-        this.trump = null; // suit or null
-        this.lastDrawerIndex = null; // who last drew card for trump determination (index)
+        this.stack = [];
+        this.trump = null;
+        this.lastDrawerIndex = null;
         this.currentAttacker = 0; // index in players
         this.currentDefender = 1; // index in players
         this.started = false;
@@ -96,6 +85,8 @@ class Game {
 
     addPlayer(id, socketId, name = 'Player') {
         if (this.started) throw new Error('Игра уже началась');
+        const maxPlayers = this.config.use52 ? 6 : 4;
+        if (this.players.length >= maxPlayers) throw new Error(`Максимум ${maxPlayers} игроков`);
         const p = new Player(id, socketId, name);
         this.players.push(p);
         return p;
@@ -117,19 +108,15 @@ class Game {
 
     dealInitial() {
         this.deck = makeDeck(this.config.use52);
-        // deal penki (2 hidden) to each player
         for (const p of this.players) {
             p.penki = [this.deck.pop(), this.deck.pop()];
         }
-        // deal 1 open card each (for starter determination)
         for (const p of this.players) {
             p.openCard = this.deck.pop();
         }
-        // optionally give each player some initial hand cards (we'll keep hand empty; players will draw later as per rules)
     }
 
     determineFirstDrawer() {
-        // find highest openCard by rank; if tie - draw more for tied players until resolved
         let maxRank = -Infinity;
         let candidates = [];
         for (let i = 0; i < this.players.length; i++) {
@@ -140,14 +127,12 @@ class Game {
         if (candidates.length === 1) {
             return candidates[0];
         }
-        // tie -> among candidates draw one additional card from deck (revealed) for each until resolved
         while (candidates.length > 1 && this.deck.length > 0) {
             const revealed = [];
             for (const idx of candidates) {
                 const c = this.deck.pop();
                 revealed.push({ idx, card: c });
             }
-            // find highest among revealed
             let highest = -Infinity;
             let newCandidates = [];
             for (const r of revealed) {
@@ -155,9 +140,7 @@ class Game {
                 else if (r.card.rank === highest) newCandidates.push(r.idx);
             }
             candidates = newCandidates;
-            // continue if tie remains
         }
-        // if still tie and deck empty -> pick first candidate
         return candidates[0] || 0;
     }
 
@@ -187,21 +170,16 @@ class Game {
         return this.players[idx % this.players.length];
     }
 
-    // attacker plays a card from their hand onto the stack to attack defender
     playCard(playerId, cardId) {
         if (!this.started) throw new Error('Игра не началась');
         const attackerIdx = this.getPlayerIndexById(playerId);
         if (attackerIdx !== this.currentAttacker) throw new Error('Не твоя очередь атаковать');
         const attacker = this.players[attackerIdx];
-        // attacker must have card in hand
         const ci = attacker.hand.findIndex(c => c.id === cardId);
         if (ci < 0) throw new Error('Карта не в руке');
         const card = attacker.hand.splice(ci, 1)[0];
         this.stack.push(card);
         this.log(`${attacker.name} атакует ${cardToString(card)}`);
-        // after attack, defender is currentDefender (must try to beat top card)
-        // if attacker emptied hand and had penki? we handle later when round closes
-        // special: if card is 7 of spades, it closes round instantly
         if (card.suit === '♠' && card.rank === 7) {
             this.log('7♠ сыграно - мгновенное закрытие атакующим');
             return this.closeRoundBy(attackerIdx);
@@ -209,44 +187,73 @@ class Game {
         return { status: 'ok', stack: this.stack.slice() };
     }
 
-    // defender tries to beat top card using defenceCardId from his hand
     defendWith(playerId, defenceCardId) {
         if (!this.started) throw new Error('Игра не началась');
+
         const defenderIdx = this.getPlayerIndexById(playerId);
         if (defenderIdx !== this.currentDefender) throw new Error('Не твоя очередь защищаться');
+
         const defender = this.players[defenderIdx];
+
         if (this.stack.length === 0) throw new Error('Нечего защищать');
+
         const attackCard = this.stack[this.stack.length - 1];
         const di = defender.hand.findIndex(c => c.id === defenceCardId);
+
         if (di < 0) throw new Error('Карта защиты не в руке');
+
         const defenceCard = defender.hand[di];
-        // Check special: if defenceCard is 7♠ it beats any card and closes round immediately
+
+        // 7♠ мгновенно закрывает ход
         if (defenceCard.suit === '♠' && defenceCard.rank === 7) {
-            // remove card from hand
             defender.hand.splice(di, 1);
             this.stack.push(defenceCard);
-            this.log(`${defender.name} защищен с 7♠ - мгновенное закрытие`);
+            this.log(`${defender.name} сыграл 7♠ - мгновенное закрытие круга`);
             return this.closeRoundBy(defenderIdx);
         }
-        // Normal canBeat check
+
         if (!canBeat(attackCard, defenceCard, this.trump, this.config.use52)) {
             throw new Error('Невозможно отразить эту атаку выбранной картой');
         }
-        // valid defence
+
         defender.hand.splice(di, 1);
         this.stack.push(defenceCard);
         this.log(`${defender.name} побил ${cardToString(attackCard)} картой ${cardToString(defenceCard)}`);
-        // If everyone in sequence has defended on their turns and round closes accordingly, handle outside.
-        // After successful defence, the next attacker in circle becomes attacker, next defender becomes next player (rotate)
-        const prevAttacker = this.currentAttacker;
-        this.currentAttacker = this.getNextIndex(this.currentAttacker);
-        this.currentDefender = this.getNextIndex(this.currentAttacker);
-        // check if round is closed (everyone managed to defend in full cycle). We'll define closing as: 
-        // when defender index loops back to the player who closed (we'll call endRoundIfClosed manually in server after actions).
-        return { status: 'defended', stack: this.stack.slice(), currentAttacker: this.currentAttacker, currentDefender: this.currentDefender };
+
+        // Следующий игрок должен отбиваться
+        this.currentDefender = this.getNextIndex(this.currentDefender);
+
+        // Проверка: если следующий игрок не может побить нижнюю карту
+        let rounds = 0;
+        while (rounds < this.players.length) {
+            const nextPlayer = this.players[this.currentDefender];
+            const bottomCard = this.stack[0];
+            const canBeatBottom = nextPlayer.hand.some(c => canBeat(bottomCard, c, this.trump, this.config.use52));
+
+            if (!canBeatBottom) {
+                // игрок берёт нижнюю карту
+                const taken = this.stack.shift();
+                nextPlayer.hand.push(taken);
+                this.log(`${nextPlayer.name} не может отбиться и берёт карту ${cardToString(taken)}`);
+            }
+
+            this.currentDefender = this.getNextIndex(this.currentDefender);
+            rounds++;
+        }
+
+        // Если стек пуст или все игроки имели шанс отбиться => закрываем круг
+        if (this.stack.length === 0 || rounds >= this.players.length) {
+            return this.closeRoundBy(this.currentAttacker);
+        }
+
+        return {
+            status: 'defended',
+            stack: this.stack.slice(),
+            currentAttacker: this.currentAttacker,
+            currentDefender: this.currentDefender
+        };
     }
 
-    // if defender cannot defend -> he takes bottom card (index 0) into his hand
     takeBottom(playerId) {
         const defenderIdx = this.getPlayerIndexById(playerId);
         if (defenderIdx !== this.currentDefender) throw new Error('Не твоя очередь брать');
@@ -255,30 +262,30 @@ class Game {
         const bottom = this.stack.shift(); // remove bottom
         defender.hand.push(bottom);
         this.log(`${defender.name} не смог отбиться и забрал карту ${cardToString(bottom)}`);
-        // turn passes to next player; rotate attacker to next player after defender
         this.currentAttacker = this.getNextIndex(this.currentAttacker);
         this.currentDefender = this.getNextIndex(this.currentAttacker);
-        // Note: we leave remaining stack as is (per your rule)
         return { status: 'took', taken: bottom, stack: this.stack.slice(), currentAttacker: this.currentAttacker, currentDefender: this.currentDefender };
     }
 
-    // close round: all cards from stack go to discard, stack cleared. Player who closed round becomes next attacker.
     closeRoundBy(playerIdx) {
-        // move stack to discard
         while (this.stack.length) this.discard.push(this.stack.shift());
-        // playerIdx becomes attacker for next round
+
         this.currentAttacker = playerIdx;
         this.currentDefender = this.getNextIndex(playerIdx);
-        // after round close, players who have fewer cards draw from deck until fullHandSize (optional)
-        this.replenishHands();
-        // reveal penki if someone has hand empty and round closed - they get their penki into hand
+
         this.revealPenkiWhereNeeded();
-        this.log(`Раунд закрыт ${playerIdx}. Козырь ${this.trump}`);
-        return { status: 'closed', currentAttacker: this.currentAttacker, currentDefender: this.currentDefender };
+
+        this.log(`Раунд закрыт. Козырь: ${this.trump}`);
+
+        return {
+            status: 'closed',
+            currentAttacker: this.currentAttacker,
+            currentDefender: this.currentDefender,
+            stack: this.stack.slice()
+        };
     }
 
     replenishHands() {
-        // standard rule: each player draws from deck until they have fullHandSize or deck empty
         for (const p of this.players) {
             while (p.hand.length < this.config.fullHandSize && this.deck.length > 0) {
                 p.hand.push(this.deck.pop());
@@ -287,7 +294,6 @@ class Game {
     }
 
     revealPenkiWhereNeeded() {
-        // If player has 0 cards and the round closed (we already closed), then give him his penki into hand (and clear penki)
         for (const p of this.players) {
             if (p.hand.length === 0 && p.penki && p.penki.length > 0) {
                 p.hand.push(...p.penki);
@@ -295,7 +301,6 @@ class Game {
                 this.log(`${p.name} взял пеньки`);
             }
         }
-        // mark out players who have no cards and no penki
         for (const p of this.players) {
             if (p.hand.length === 0 && (!p.penki || p.penki.length === 0)) {
                 p.out = true;
